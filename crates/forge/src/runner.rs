@@ -43,7 +43,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tracing::Span;
+use tracing::{Span, error};
 
 /// When running tests, we deploy all external libraries present in the project. To avoid additional
 /// libraries affecting nonces of senders used in tests, we are using separate address to
@@ -723,6 +723,7 @@ impl<'a> FunctionRunner<'a> {
 
         let runner = self.invariant_runner();
         let invariant_config = &self.config.invariant;
+        let persist_dir = invariant_config.failure_persist_dir.clone().unwrap();
 
         let mut executor = self.clone_executor();
         // Enable edge coverage if running with coverage guided fuzzing or with edge coverage
@@ -733,7 +734,7 @@ impl<'a> FunctionRunner<'a> {
         let mut config = invariant_config.clone();
         let (failure_dir, failure_file) = test_paths(
             &mut config.corpus,
-            invariant_config.failure_persist_dir.clone().unwrap(),
+            persist_dir.clone(),
             self.cr.name,
             &func.name,
         );
@@ -837,7 +838,7 @@ impl<'a> FunctionRunner<'a> {
         let success = invariant_result.error.is_none();
         let reason = invariant_result.error.as_ref().and_then(|err| err.revert_reason());
 
-        match invariant_result.error {
+        match &invariant_result.error {
             // If invariants were broken, replay the error to collect logs and traces
             Some(error) => match error {
                 InvariantFuzzError::BrokenInvariant(case_data)
@@ -911,6 +912,68 @@ impl<'a> FunctionRunner<'a> {
             }
         }
 
+        // Persist all invariant runs.
+        let (runs_dir, runs_file) = test_runs_paths(
+            persist_dir,
+            self.cr.name,
+            &func.name,
+            "invariant",
+        );
+        
+        // Create invariant call sequences data
+        let mut call_sequences = Vec::new();
+        
+        // Add the last run sequence (always available)
+        if !invariant_result.last_run_inputs.is_empty() {
+            let sequence_calls = invariant_result.last_run_inputs
+                .iter()
+                .map(|tx| BaseCounterExample::from_invariant_call(
+                    tx.sender,
+                    tx.call_details.target,
+                    &tx.call_details.calldata,
+                    &identified_contracts,
+                    None,
+                    show_solidity,
+                ))
+                .collect();
+            
+            call_sequences.push(InvariantCallSequence {
+                calls: sequence_calls,
+                broke_invariant: invariant_result.error.is_some(),
+                error_message: reason.clone(),
+            });
+        }
+        
+        // Add failed sequence if any
+        if let Some(CounterExample::Sequence(_, ref failed_sequence)) = counterexample {
+            call_sequences.push(InvariantCallSequence {
+                calls: failed_sequence.clone(),
+                broke_invariant: true,
+                error_message: reason.clone(),
+            });
+        }
+        
+        let total_sequences = invariant_result.cases.len();
+        let failed_sequences = if invariant_result.error.is_some() { 1 } else { 0 };
+        
+        let invariant_runs = InvariantRunsPersisted {
+            call_sequences,
+            total_sequences,
+            failed_sequences,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        
+        if let Err(err) = foundry_common::fs::create_dir_all(runs_dir) {
+            error!(%err, "Failed to create invariant runs dir");
+        } else if let Err(err) =
+            foundry_common::fs::write_json_file(runs_file.as_path(), &invariant_runs)
+        {
+            error!(%err, "Failed to record invariant runs");
+        }
+
         self.result.invariant_result(
             invariant_result.gas_report_traces,
             success,
@@ -941,9 +1004,10 @@ impl<'a> FunctionRunner<'a> {
 
         let runner = self.fuzz_runner();
         let mut fuzz_config = self.config.fuzz.clone();
+        let persist_dir = fuzz_config.failure_persist_dir.clone().unwrap();
         let (failure_dir, failure_file) = test_paths(
             &mut fuzz_config.corpus,
-            fuzz_config.failure_persist_dir.clone().unwrap(),
+            persist_dir.clone(),
             self.cr.name,
             &func.name,
         );
@@ -991,6 +1055,73 @@ impl<'a> FunctionRunner<'a> {
             {
                 error!(%err, "Failed to record call sequence");
             }
+        }
+
+        // Persist all fuzz runs.
+        let (runs_dir, runs_file) = test_runs_paths(
+            persist_dir,
+            self.cr.name,
+            &func.name,
+            "fuzz",
+        );
+        
+        // Calculate gas statistics
+        let gas_stats = if result.gas_by_case.is_empty() {
+            GasStats { min_gas: 0, max_gas: 0, avg_gas: 0 }
+        } else {
+            let total_gas: u64 = result.gas_by_case.iter().map(|(gas, _)| gas).sum();
+            let min_gas = result.gas_by_case.iter().map(|(gas, _)| *gas).min().unwrap_or(0);
+            let max_gas = result.gas_by_case.iter().map(|(gas, _)| *gas).max().unwrap_or(0);
+            let avg_gas = total_gas / result.gas_by_case.len() as u64;
+            GasStats { min_gas, max_gas, avg_gas }
+        };
+        
+        // Count successful runs (total runs minus 1 if there's a counterexample)
+        let total_runs = result.gas_by_case.len();
+        let successful_runs = if result.counterexample.is_some() {
+            total_runs.saturating_sub(1)
+        } else {
+            total_runs
+        };
+        
+        // Create a simplified view of test cases based on available data
+        let mut test_cases = Vec::new();
+        
+        // Add first case
+        test_cases.push(FuzzTestCase {
+            calldata: result.first_case.calldata.clone(),
+            success: true,
+            gas_used: result.first_case.gas,
+            revert_reason: None,
+        });
+        
+        // Add counterexample if available
+        if let Some(CounterExample::Single(ref counterexample)) = result.counterexample {
+            test_cases.push(FuzzTestCase {
+                calldata: counterexample.calldata.clone(),
+                success: false,
+                gas_used: result.gas_by_case.last().map(|(gas, _)| *gas).unwrap_or(0),
+                revert_reason: result.reason.clone(),
+            });
+        }
+        
+        let fuzz_runs = FuzzRunsPersisted {
+            test_cases,
+            total_runs,
+            successful_runs,
+            gas_stats,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        
+        if let Err(err) = foundry_common::fs::create_dir_all(runs_dir) {
+            error!(%err, "Failed to create fuzz runs dir");
+        } else if let Err(err) =
+            foundry_common::fs::write_json_file(runs_file.as_path(), &fuzz_runs)
+        {
+            error!(%err, "Failed to record fuzz runs");
         }
 
         self.result.fuzz_result(result);
@@ -1090,6 +1221,69 @@ struct InvariantPersistedFailure {
     driver_bytecode: Option<Bytes>,
 }
 
+/// Holds data about all fuzz test runs for persistence.
+#[derive(Serialize, Deserialize)]
+struct FuzzRunsPersisted {
+    /// All test cases that were executed
+    test_cases: Vec<FuzzTestCase>,
+    /// Total number of runs
+    total_runs: usize,
+    /// Number of successful runs
+    successful_runs: usize,
+    /// Gas usage statistics
+    gas_stats: GasStats,
+    /// Timestamp of the test run
+    timestamp: u64,
+}
+
+/// Individual fuzz test case data
+#[derive(Serialize, Deserialize)]
+struct FuzzTestCase {
+    /// The calldata used for this test case
+    calldata: Bytes,
+    /// Whether this test case was successful
+    success: bool,
+    /// Gas used
+    gas_used: u64,
+    /// Revert reason if any
+    revert_reason: Option<String>,
+}
+
+/// Gas statistics for fuzz runs
+#[derive(Serialize, Deserialize)]
+struct GasStats {
+    /// Minimum gas used
+    min_gas: u64,
+    /// Maximum gas used
+    max_gas: u64,
+    /// Average gas used
+    avg_gas: u64,
+}
+
+/// Holds data about all invariant test runs for persistence.
+#[derive(Serialize, Deserialize)]
+struct InvariantRunsPersisted {
+    /// All call sequences that were tested
+    call_sequences: Vec<InvariantCallSequence>,
+    /// Total number of sequences tested
+    total_sequences: usize,
+    /// Number of sequences that broke invariants
+    failed_sequences: usize,
+    /// Timestamp of the test run
+    timestamp: u64,
+}
+
+/// Individual invariant call sequence data
+#[derive(Serialize, Deserialize)]
+struct InvariantCallSequence {
+    /// The sequence of calls
+    calls: Vec<BaseCounterExample>,
+    /// Whether this sequence broke an invariant
+    broke_invariant: bool,
+    /// Error message if invariant was broken
+    error_message: Option<String>,
+}
+
 /// Helper function to load failed call sequence from file.
 /// Ignores failure if generated with different test contract than the current one.
 fn persisted_call_sequence(path: &Path, bytecode: &Bytes) -> Option<Vec<BaseCounterExample>> {
@@ -1124,4 +1318,21 @@ fn test_paths(
     let failures_dir = canonicalized(persist_dir.join("failures").join(contract));
     let failure_file = canonicalized(failures_dir.join(test_name));
     (failures_dir, failure_file)
+}
+
+/// Helper function to get paths for persisting all test runs.
+fn test_runs_paths(
+    persist_dir: PathBuf,
+    contract_name: &str,
+    test_name: &str,
+    test_type: &str,
+) -> (PathBuf, PathBuf) {
+    let contract = contract_name.split(':').next_back().unwrap();
+    let runs_dir = canonicalized(persist_dir.join("runs").join(contract));
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let runs_file = canonicalized(runs_dir.join(format!("{}_{}_{}.json", test_name, test_type, timestamp)));
+    (runs_dir, runs_file)
 }
